@@ -60,9 +60,14 @@ def _metadata_to_model(metadata: dict[bytes, bytes] | None) -> list[dict[str, st
     ]
 
 
-def _field_to_model(field: pa.Field, metadata: MetadataMode) -> dict[str, Any]:
+def _field_to_model(
+    field: pa.Field,
+    metadata: MetadataMode,
+    *,
+    canonical_name: str | None = None,
+) -> dict[str, Any]:
     model: dict[str, Any] = {
-        "name": field.name,
+        "name": field.name if canonical_name is None else canonical_name,
         "nullable": field.nullable,
         "type": _type_to_model(field.type, metadata),
     }
@@ -81,23 +86,23 @@ def _type_to_model(data_type: pa.DataType, metadata: MetadataMode) -> dict[str, 
         return {
             "kind": "fixed_size_list",
             "size": data_type.list_size,
-            "value": _field_to_model(data_type.value_field, metadata),
+            "value": _field_to_model(data_type.value_field, metadata, canonical_name="element"),
         }
     if pa.types.is_large_list(data_type):
         return {
             "kind": "large_list",
-            "value": _field_to_model(data_type.value_field, metadata),
+            "value": _field_to_model(data_type.value_field, metadata, canonical_name="element"),
         }
     if pa.types.is_list(data_type):
         return {
             "kind": "list",
-            "value": _field_to_model(data_type.value_field, metadata),
+            "value": _field_to_model(data_type.value_field, metadata, canonical_name="element"),
         }
     if pa.types.is_map(data_type):
         return {
             "kind": "map",
-            "item": _field_to_model(data_type.item_field, metadata),
-            "key": _field_to_model(data_type.key_field, metadata),
+            "item": _field_to_model(data_type.item_field, metadata, canonical_name="value"),
+            "key": _field_to_model(data_type.key_field, metadata, canonical_name="key"),
             "keys_sorted": data_type.keys_sorted,
         }
     if pa.types.is_dictionary(data_type):
@@ -121,6 +126,7 @@ def _type_to_model(data_type: pa.DataType, metadata: MetadataMode) -> dict[str, 
         return {
             "kind": "extension",
             "name": data_type.extension_name,
+            "serialized": base64.b64encode(data_type.__arrow_ext_serialize__()).decode("ascii"),
             "storage": _type_to_model(data_type.storage_type, metadata),
         }
     return {"kind": "scalar", "name": str(data_type)}
@@ -141,43 +147,51 @@ def _compare_fields(
             if count > 1
         }
     )
-    if duplicate_names:
-        for name in duplicate_names:
-            differences.append(
-                {
-                    "actual": actual_names.count(name),
-                    "code": "duplicate_field_name",
-                    "expected": reference_names.count(name),
-                    "path": _join_path(path, name),
-                }
-            )
-        return
+    for name in duplicate_names:
+        differences.append(
+            {
+                "actual": actual_names.count(name),
+                "code": "duplicate_field_name",
+                "expected": reference_names.count(name),
+                "path": _join_path(path, name),
+            }
+        )
 
-    reference_by_name = {field["name"]: field for field in reference}
-    actual_by_name = {field["name"]: field for field in actual}
+    reference_by_name: dict[str, list[dict[str, Any]]] = {}
+    actual_by_name: dict[str, list[dict[str, Any]]] = {}
+    for field in reference:
+        reference_by_name.setdefault(field["name"], []).append(field)
+    for field in actual:
+        actual_by_name.setdefault(field["name"], []).append(field)
 
-    for name in reference_names:
-        if name not in actual_by_name:
+    for name in dict.fromkeys(reference_names):
+        reference_fields = reference_by_name[name]
+        actual_fields = actual_by_name.get(name, [])
+        total = max(len(reference_fields), len(actual_fields))
+        for index in range(len(actual_fields), len(reference_fields)):
             differences.append(
                 {
                     "actual": "missing",
                     "code": "field_removed",
-                    "expected": _render_type(reference_by_name[name]["type"]),
-                    "path": _join_path(path, name),
+                    "expected": _render_type(reference_fields[index]["type"]),
+                    "path": _occurrence_path(path, name, index, total),
                 }
             )
-    for name in actual_names:
-        if name not in reference_by_name:
+    for name in dict.fromkeys(actual_names):
+        actual_fields = actual_by_name[name]
+        reference_fields = reference_by_name.get(name, [])
+        total = max(len(reference_fields), len(actual_fields))
+        for index in range(len(reference_fields), len(actual_fields)):
             differences.append(
                 {
-                    "actual": _render_type(actual_by_name[name]["type"]),
+                    "actual": _render_type(actual_fields[index]["type"]),
                     "code": "field_added",
                     "expected": "absent",
-                    "path": _join_path(path, name),
+                    "path": _occurrence_path(path, name, index, total),
                 }
             )
 
-    if set(reference_names) == set(actual_names) and reference_names != actual_names:
+    if Counter(reference_names) == Counter(actual_names) and reference_names != actual_names:
         differences.append(
             {
                 "actual": actual_names,
@@ -187,12 +201,18 @@ def _compare_fields(
             }
         )
 
-    for name in reference_names:
-        if name in actual_by_name:
+    seen: Counter[str] = Counter()
+    for reference_field in reference:
+        name = reference_field["name"]
+        index = seen[name]
+        seen[name] += 1
+        actual_fields = actual_by_name.get(name, [])
+        if index < len(actual_fields):
+            total = max(len(reference_by_name[name]), len(actual_fields))
             _compare_field(
-                reference_by_name[name],
-                actual_by_name[name],
-                _join_path(path, name),
+                reference_field,
+                actual_fields[index],
+                _occurrence_path(path, name, index, total),
                 differences,
             )
 
@@ -298,7 +318,7 @@ def _compare_type(
         _compare_fields(reference["fields"], actual["fields"], path, differences)
         return
     if kind == "extension":
-        if reference["name"] != actual["name"]:
+        if reference["name"] != actual["name"] or reference["serialized"] != actual["serialized"]:
             _append_type_change(reference, actual, path, differences)
             return
         _compare_type(reference["storage"], actual["storage"], path, differences)
@@ -336,16 +356,41 @@ def _render_type(model: dict[str, Any]) -> str:
         size = f"[{model['size']}]" if kind == "fixed_size_list" else ""
         return f"{kind}{size}<{_render_type(model['value']['type'])}>"
     if kind == "map":
-        return f"map<{_render_type(model['key']['type'])}, {_render_type(model['item']['type'])}>"
+        keys_sorted = str(model["keys_sorted"]).lower()
+        return (
+            f"map<{_render_type(model['key']['type'])}, "
+            f"{_render_type(model['item']['type'])}; keys_sorted={keys_sorted}>"
+        )
     if kind == "dictionary":
-        return f"dictionary<{_render_type(model['index'])}, {_render_type(model['value'])}>"
+        ordered = str(model["ordered"]).lower()
+        return (
+            f"dictionary<{_render_type(model['index'])}, {_render_type(model['value'])}; "
+            f"ordered={ordered}>"
+        )
     if kind == "extension":
-        return f"extension<{model['name']}>"
+        state = base64.b64decode(model["serialized"])
+        state_hash = hashlib.sha256(state).hexdigest()[:12]
+        return (
+            f"extension<{model['name']}; state=sha256:{state_hash}; "
+            f"storage={_render_type(model['storage'])}>"
+        )
     if kind == "union":
-        return f"{model['mode']}_union"
+        fields = ", ".join(
+            (
+                f"{field['name']}: {_render_type(field['type'])}"
+                f"{'?' if field['nullable'] else '!'}@{type_code}"
+            )
+            for field, type_code in zip(model["fields"], model["type_codes"], strict=True)
+        )
+        return f"{model['mode']}_union<{fields}>"
     return json.dumps(model, ensure_ascii=False, sort_keys=True)
 
 
 def _join_path(path: str, segment: str) -> str:
     escaped = segment.replace("~", "~0").replace("/", "~1")
     return f"/{escaped}" if path == "/" else f"{path}/{escaped}"
+
+
+def _occurrence_path(path: str, name: str, index: int, total: int) -> str:
+    field_path = _join_path(path, name)
+    return _join_path(field_path, f"#{index + 1}") if total > 1 else field_path

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -9,6 +11,11 @@ from typing import Any
 import pyarrow.parquet as pq
 
 from parquet_drift.schema import MetadataMode, diff_schemas, fingerprint_schema, schema_to_model
+
+REPORT_SCHEMA_URL = (
+    "https://raw.githubusercontent.com/fushanbobfan/parquet-drift/"
+    "v0.1.0/src/parquet_drift/schemas/audit-report-v1.schema.json"
+)
 
 
 class InputError(ValueError):
@@ -30,15 +37,18 @@ def audit_dataset(
         raise InputError("--max-files-per-group must be at least 0")
 
     root, files = _discover_files(Path(dataset))
-    results = _read_all(files, root=root, metadata=metadata, jobs=jobs)
-    readable = [result for result in results if "schema" in result]
-    unreadable = [result for result in results if "schema" not in result]
-
     grouped: dict[str, dict[str, Any]] = {}
-    for result in readable:
+    readable_count = 0
+    unreadable: list[dict[str, Any]] = []
+    for result in _read_all(files, root=root, metadata=metadata, jobs=jobs):
+        if "schema" not in result:
+            unreadable.append(result)
+            continue
+        readable_count += 1
+        schema = result.pop("schema")
         group = grouped.setdefault(
             result["fingerprint"],
-            {"fingerprint": result["fingerprint"], "files": [], "schema": result["schema"]},
+            {"fingerprint": result["fingerprint"], "files": [], "schema": schema},
         )
         group["files"].append(result["path"])
 
@@ -110,8 +120,9 @@ def audit_dataset(
         for group in grouped.values()
         if group["fingerprint"] != reference_fingerprint
     )
-    status = "pass" if not unreadable and drifted_files == 0 and bool(readable) else "drift"
+    status = "pass" if not unreadable and drifted_files == 0 and readable_count > 0 else "drift"
     return {
+        "$schema": REPORT_SCHEMA_URL,
         "groups": report_groups,
         "metadata": metadata,
         "reference": reference_info,
@@ -120,7 +131,7 @@ def audit_dataset(
         "summary": {
             "drifted_files": drifted_files,
             "files": len(files),
-            "readable_files": len(readable),
+            "readable_files": readable_count,
             "schema_variants": len(grouped),
             "unreadable_files": len(unreadable),
         },
@@ -142,14 +153,46 @@ def _discover_files(dataset: Path) -> tuple[Path, list[Path]]:
     if not resolved.is_dir():
         raise InputError(f"path is not a file or directory: {dataset}")
 
-    files = sorted(
-        (
-            path
-            for path in resolved.rglob("*")
-            if path.is_file() and path.suffix.lower() == ".parquet"
-        ),
-        key=lambda path: path.relative_to(resolved).as_posix(),
-    )
+    files: list[Path] = []
+
+    def traversal_error(error: OSError) -> None:
+        location = Path(error.filename) if error.filename else resolved
+        relative = _relative_path(location, resolved)
+        reason = error.strerror or type(error).__name__
+        raise InputError(f"cannot traverse dataset directory {relative}: {reason}") from error
+
+    for directory, names, filenames in os.walk(
+        resolved,
+        topdown=True,
+        onerror=traversal_error,
+        followlinks=False,
+    ):
+        names.sort()
+        filenames.sort()
+        current = Path(directory)
+        for name in names:
+            child = current / name
+            try:
+                is_symlink = child.is_symlink()
+            except OSError as error:
+                traversal_error(error)
+            if is_symlink:
+                relative = child.relative_to(resolved).as_posix()
+                raise InputError(f"symlinked directory is not scanned: {relative}")
+        for name in filenames:
+            path = current / name
+            if path.suffix.lower() == ".parquet":
+                try:
+                    is_symlink = path.is_symlink()
+                    is_file = path.is_file()
+                except OSError as error:
+                    traversal_error(error)
+                relative = path.relative_to(resolved).as_posix()
+                if is_symlink:
+                    raise InputError(f"symlinked Parquet file is not scanned: {relative}")
+                if not is_file:
+                    raise InputError(f"Parquet path is not a regular file: {relative}")
+                files.append(path)
     if not files:
         raise InputError(f"no .parquet files found under: {dataset}")
     return resolved, files
@@ -161,11 +204,13 @@ def _read_all(
     root: Path,
     metadata: MetadataMode,
     jobs: int,
-) -> list[dict[str, Any]]:
+) -> Iterator[dict[str, Any]]:
     if jobs == 1:
-        return [_read_one(path, root=root, metadata=metadata) for path in files]
+        for path in files:
+            yield _read_one(path, root=root, metadata=metadata)
+        return
     with ThreadPoolExecutor(max_workers=jobs) as executor:
-        return list(executor.map(lambda path: _read_one(path, root=root, metadata=metadata), files))
+        yield from executor.map(lambda path: _read_one(path, root=root, metadata=metadata), files)
 
 
 def _read_one(path: Path, *, root: Path, metadata: MetadataMode) -> dict[str, Any]:

@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/fushanbobfan/parquet-drift/v0.1.0/src/parquet_drift/schemas/audit-report-v1.schema.json",
+  "title": "parquet-drift audit report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "groups",
+    "metadata",
+    "reference",
+    "report_version",
+    "status",
+    "summary",
+    "unreadable"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "https://raw.githubusercontent.com/fushanbobfan/parquet-drift/v0.1.0/src/parquet_drift/schemas/audit-report-v1.schema.json"
+    },
+    "groups": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/group" }
+    },
+    "metadata": { "enum": ["ignore", "exact"] },
+    "reference": { "$ref": "#/$defs/reference" },
+    "report_version": { "const": 1 },
+    "status": { "enum": ["pass", "drift"] },
+    "summary": { "$ref": "#/$defs/summary" },
+    "unreadable": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/unreadable" }
+    }
+  },
+  "$defs": {
+    "difference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["actual", "code", "expected", "path"],
+      "properties": {
+        "actual": {},
+        "code": { "type": "string", "minLength": 1 },
+        "expected": {},
+        "path": { "type": "string", "pattern": "^/" }
+      }
+    },
+    "group": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "file_count",
+        "files",
+        "files_truncated",
+        "fingerprint",
+        "is_reference"
+      ],
+      "properties": {
+        "differences": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/difference" }
+        },
+        "file_count": { "type": "integer", "minimum": 1 },
+        "files": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "files_truncated": { "type": "integer", "minimum": 0 },
+        "fingerprint": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "is_reference": { "type": "boolean" }
+      }
+    },
+    "reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strategy"],
+      "properties": {
+        "file_count": { "type": "integer", "minimum": 0 },
+        "fingerprint": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "path": { "type": "string", "minLength": 1 },
+        "selection_tied": { "type": "boolean" },
+        "strategy": { "enum": ["explicit", "mode", "unavailable"] }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "drifted_files",
+        "files",
+        "readable_files",
+        "schema_variants",
+        "unreadable_files"
+      ],
+      "properties": {
+        "drifted_files": { "type": "integer", "minimum": 0 },
+        "files": { "type": "integer", "minimum": 1 },
+        "readable_files": { "type": "integer", "minimum": 0 },
+        "schema_variants": { "type": "integer", "minimum": 0 },
+        "unreadable_files": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "unreadable": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["error", "message", "path"],
+      "properties": {
+        "error": { "type": "string", "minLength": 1 },
+        "message": { "type": "string" },
+        "path": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

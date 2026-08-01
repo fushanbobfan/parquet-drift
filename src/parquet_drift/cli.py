@@ -86,33 +86,48 @@ def _render_text(report: dict[str, Any]) -> str:
     heading = "PASS" if report["status"] == "pass" else "DRIFT"
     lines = [
         (
-            f"{heading}  {summary['files']} files, {summary['schema_variants']} schema variants, "
-            f"{summary['unreadable_files']} unreadable"
+            f"{heading}  {_count(summary['files'], 'file')}, "
+            f"{_count(summary['schema_variants'], 'schema variant')}, "
+            f"{_count(summary['unreadable_files'], 'unreadable file')}"
         )
     ]
     reference = report["reference"]
     if reference["strategy"] != "unavailable":
         detail = f"Reference: {reference['strategy']} {reference['fingerprint']}"
         if reference.get("path"):
-            detail += f" ({reference['path']})"
+            detail += f" ({_safe_text(reference['path'])})"
         if reference.get("selection_tied"):
             detail += " [deterministic tie-break]"
         lines.append(detail)
     lines.append(f"Metadata: {report['metadata']}")
 
     for item in report["unreadable"]:
-        lines.append(f"Unreadable {item['path']}: {item['error']}: {item['message']}")
+        lines.append(
+            f"Unreadable {_safe_text(item['path'])}: {_safe_text(item['error'])}: "
+            f"{_safe_text(item['message'])}"
+        )
 
     for group in report["groups"]:
         marker = "reference" if group["is_reference"] else "drift"
-        lines.append(f"Schema {group['fingerprint']} ({group['file_count']} files, {marker})")
+        lines.append(
+            f"Schema {group['fingerprint']} ({_count(group['file_count'], 'file')}, {marker})"
+        )
         for path in group["files"]:
-            lines.append(f"  {path}")
+            lines.append(f"  {_safe_text(path)}")
         if group["files_truncated"]:
             lines.append(f"  ... {group['files_truncated']} more files")
         for difference in group.get("differences", []):
             lines.append(
-                f"  - {difference['code']} {difference['path']}: "
-                f"{difference['expected']} -> {difference['actual']}"
+                f"  - {_safe_text(difference['code'])} {_safe_text(difference['path'])}: "
+                f"{_safe_text(difference['expected'])} -> {_safe_text(difference['actual'])}"
             )
     return "\n".join(lines)
+
+
+def _count(value: int, noun: str) -> str:
+    return f"{value} {noun if value == 1 else noun + 's'}"
+
+
+def _safe_text(value: Any) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return encoded[1:-1] if isinstance(value, str) else encoded
